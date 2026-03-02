@@ -1,0 +1,241 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/lightning.py b/lightning.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3083435a5ce99d22c3a3f96acdfb2ccab3e697a
+--- /dev/null
++++ b/lightning.py
+@@ -0,0 +1,231 @@
++#!/usr/bin/env python3
++"""Generate a 2D lightning animation as a sequence of PNG frames and optional MP4.
++
++This script uses only the Python standard library, numpy, and matplotlib.
++It creates a dark canvas with labels for potential at the top and bottom,
++then draws one or more fractal lightning bolts propagating downward with
++occasional branching. The animation is saved to frames/ and optionally
++assembled into lightning.mp4 if ffmpeg is available.
++"""
++from __future__ import annotations
++
++import math
++import os
++import shutil
++from dataclasses import dataclass, field
++from typing import List, Tuple
++
++import matplotlib
++import matplotlib.pyplot as plt
++import numpy as np
++
++matplotlib.use("Agg")
++
++# =====================
++# Configurable settings
++# =====================
++SEED = 7
++WIDTH = 720
++HEIGHT = 1280
++FPS = 24
++DURATION_S = 6.0  # total loop duration (seconds)
++NUM_BOLTS = 2
++GLOW_INTENSITY = 0.8  # 0..1 scales glow alpha
++BRANCH_PROB = 0.06
++SEGMENTS_PER_FRAME = 6  # propagation speed
++MAIN_LINEWIDTH = 2.5
++BRANCH_LINEWIDTH = 1.2
++STEP_SIZE = 10.0
++ANGLE_STD_DEG = 18.0
++MAX_BRANCH_DEPTH = 2
++BRANCH_LIFE_SCALE = 0.55
++BRANCH_WIDTH_SCALE = 0.7
++BACKGROUND_COLOR = (0.02, 0.02, 0.05)
++LINE_COLOR = (0.6, 0.85, 1.0)
++
++OUTPUT_DIR = "frames"
++OUTPUT_MP4 = "lightning.mp4"
++
++
++@dataclass
++class Tip:
++    x: float
++    y: float
++    width: float
++    max_steps: int
++    depth: int = 0
++    alive: bool = True
++
++
++@dataclass
++class Segment:
++    x0: float
++    y0: float
++    x1: float
++    y1: float
++    width: float
++    birth_step: int
++
++
++@dataclass
++class Bolt:
++    segments: List[Segment] = field(default_factory=list)
++    total_steps: int = 0
++
++
++def generate_bolt(rng: np.random.Generator, start_x: float) -> Bolt:
++    """Generate a single lightning bolt with branching."""
++    tips: List[Tip] = [Tip(start_x, 0.0, MAIN_LINEWIDTH, max_steps=int(HEIGHT / STEP_SIZE) + 30)]
++    segments: List[Segment] = []
++    step = 0
++    angle_std = math.radians(ANGLE_STD_DEG)
++
++    while any(tip.alive for tip in tips):
++        for tip in list(tips):
++            if not tip.alive:
++                continue
++
++            angle = rng.normal(0.0, angle_std)
++            dx = STEP_SIZE * math.sin(angle)
++            dy = STEP_SIZE * math.cos(angle)
++
++            x1 = tip.x + dx
++            y1 = tip.y + dy
++
++            x1 = min(max(x1, 10.0), WIDTH - 10.0)
++            y1 = min(y1, HEIGHT + 20.0)
++
++            segments.append(Segment(tip.x, tip.y, x1, y1, tip.width, step))
++
++            tip.x, tip.y = x1, y1
++
++            if y1 >= HEIGHT or step >= tip.max_steps:
++                tip.alive = False
++
++            if tip.alive and tip.depth < MAX_BRANCH_DEPTH and rng.random() < BRANCH_PROB:
++                branch_steps = max(10, int(tip.max_steps * BRANCH_LIFE_SCALE))
++                tips.append(
++                    Tip(
++                        x=tip.x,
++                        y=tip.y,
++                        width=tip.width * BRANCH_WIDTH_SCALE,
++                        max_steps=branch_steps,
++                        depth=tip.depth + 1,
++                    )
++                )
++        step += 1
++
++    return Bolt(segments=segments, total_steps=step)
++
++
++def build_scene_segments(rng: np.random.Generator) -> Tuple[List[Segment], int]:
++    """Create all lightning segments and return combined list + total steps."""
++    all_segments: List[Segment] = []
++    max_steps = 0
++
++    for _ in range(NUM_BOLTS):
++        start_x = rng.uniform(WIDTH * 0.3, WIDTH * 0.7)
++        bolt = generate_bolt(rng, start_x=start_x)
++        all_segments.extend(bolt.segments)
++        max_steps = max(max_steps, bolt.total_steps)
++
++    return all_segments, max_steps
++
++
++def draw_segments(ax: plt.Axes, segments: List[Segment], step_limit: int) -> None:
++    """Draw segments whose birth_step is <= step_limit."""
++    glow_layers = [
++        (4.0, 0.08 * GLOW_INTENSITY),
++        (2.5, 0.14 * GLOW_INTENSITY),
++        (1.0, 0.9),
++    ]
++
++    for segment in segments:
++        if segment.birth_step > step_limit:
++            continue
++        for scale, alpha in glow_layers:
++            ax.plot(
++                [segment.x0, segment.x1],
++                [segment.y0, segment.y1],
++                color=LINE_COLOR,
++                linewidth=segment.width * scale,
++                alpha=alpha,
++                solid_capstyle="round",
++            )
++
++
++def render_frames(segments: List[Segment], total_steps: int) -> None:
++    """Render animation frames to disk, looping to reach desired duration."""
++    os.makedirs(OUTPUT_DIR, exist_ok=True)
++
++    core_frames = max(1, math.ceil((total_steps + 1) / SEGMENTS_PER_FRAME))
++    total_frames = int(FPS * DURATION_S)
++    if total_frames < core_frames:
++        total_frames = core_frames
++
++    fig = plt.figure(figsize=(WIDTH / 100.0, HEIGHT / 100.0), dpi=100)
++    ax = fig.add_axes([0, 0, 1, 1])
++
++    for frame in range(total_frames):
++        ax.clear()
++        ax.set_facecolor(BACKGROUND_COLOR)
++        ax.set_xlim(0, WIDTH)
++        ax.set_ylim(HEIGHT, 0)
++        ax.axis("off")
++
++        loop_frame = frame % core_frames
++        step_limit = loop_frame * SEGMENTS_PER_FRAME
++        draw_segments(ax, segments, step_limit)
++
++        ax.text(
++            WIDTH / 2,
++            40,
++            "V = 0",
++            color="white",
++            ha="center",
++            va="center",
++            fontsize=22,
++            fontweight="bold",
++        )
++        ax.text(
++            WIDTH / 2,
++            HEIGHT - 40,
++            "V = 1",
++            color="white",
++            ha="center",
++            va="center",
++            fontsize=22,
++            fontweight="bold",
++        )
++
++        frame_path = os.path.join(OUTPUT_DIR, f"frame_{frame:04d}.png")
++        fig.savefig(frame_path, dpi=100)
++
++    plt.close(fig)
++
++
++def maybe_write_mp4() -> None:
++    """Use ffmpeg to assemble an MP4 if available, else print command."""
++    if shutil.which("ffmpeg") is None:
++        print("ffmpeg not found. To create a video, run:")
++        print(
++            f"ffmpeg -y -framerate {FPS} -i {OUTPUT_DIR}/frame_%04d.png "
++            "-c:v libx264 -pix_fmt yuv420p lightning.mp4"
++        )
++        return
++
++    os.system(
++        f"ffmpeg -y -framerate {FPS} -i {OUTPUT_DIR}/frame_%04d.png "
++        f"-c:v libx264 -pix_fmt yuv420p {OUTPUT_MP4}"
++    )
++
++
++def main() -> None:
++    rng = np.random.default_rng(SEED)
++    segments, total_steps = build_scene_segments(rng)
++    render_frames(segments, total_steps)
++    maybe_write_mp4()
++
++
++if __name__ == "__main__":
++    main()
+ 
+EOF
+)
