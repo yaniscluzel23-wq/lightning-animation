@@ -1,3 +1,7 @@
+# Demo
+
+https://github.com/yaniscluzel23-wq/lightning-animation/blob/main/lightning.mp4
+
 # Lightning (procedural animation) - Python
 
 Génère un effet "lightning" en frames PNG puis assemble une vidéo MP4 via FFmpeg.
